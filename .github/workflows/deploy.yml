@@ -1,0 +1,106 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main", "env/staging" ]
+  pull_request:
+    branches: [ "main", "env/staging" ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+jobs:
+  build-and-push-image:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install detect-secrets
+        run: |
+          pip install detect-secrets
+          
+      - name: Scan for secrets
+        run: |
+          detect-secrets scan --exclude-files '.git/*' --all-files > .secrets.baseline
+          if [ "$(jq -r '.results | length' .secrets.baseline)" -gt 0 ]; then
+            echo "Potential secrets detected!"
+            cat .secrets.baseline
+            exit 1
+          else
+            echo "No potential secrets detected."
+          fi
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@9ec57ed1fcdbf14dcef7dfbe97b2010124a938b7
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      - name: Build and push Docker image
+        id: push
+        uses: docker/build-push-action@f2a1d5e99d037542a71f64918e516c093c6f3fc4
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME}}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          python -m venv venv
+          . venv/bin/activate
+          pip install -r requirements.txt
+  
+      - name: Run unit and integration tests
+        run: |
+          . venv/bin/activate
+          PYTHONPATH=. pytest
+
+      - name: Start minikube
+        uses: medyagh/setup-minikube@latest
+
+      - name: Deploy to Minikube
+        run: |
+          kubectl create secret generic db-secret \
+            --from-literal=PG_PASSWORD=${{ secrets.PG_PASSWORD }} \
+            --from-literal=PG_USER=${{ secrets.PG_USER }} \
+            --from-literal=PG_DB=${{ secrets.PG_DB }}
+          kubectl apply -f k8s/PV.yaml
+          kubectl apply -f k8s/postgres-deployment.yaml
+          kubectl wait --for=condition=ready pod -l app=postgres --timeout=300s
+          kubectl apply -f k8s/coffee-api-deployment.yaml
+          kubectl wait --for=condition=ready pod -l app=coffee-api --timeout=300s
+
+      - name: Check service in Minikube
+        run: |
+          minikube service list
+          minikube service coffee-api-service --url
+          echo "------------------opening the service------------------"
+          curl $(minikube service coffee-api-service --url)/metrics
